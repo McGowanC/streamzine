@@ -3,12 +3,16 @@ from pydantic import BaseModel, HttpUrl, Field
 import os
 from dotenv import load_dotenv
 import re
-
-# Import from our new youtube_utils module
-from .youtube_utils import fetch_youtube_video_data, VideoMetadata as YouTubeVideoMetadata # Renaming to avoid conflict
+from typing import List, Dict, Any # Added for type hinting
 
 # Load environment variables from .env file if it exists (for local development)
 load_dotenv()
+print(f"DEBUG: ANTHROPIC_API_KEY in main.py after load_dotenv: {os.getenv('ANTHROPIC_API_KEY')}") # Debug line
+
+# Import from our utility modules
+from .youtube_utils import fetch_youtube_video_data, VideoMetadata as YouTubeVideoMetadata, TranscriptSegment
+from .llm_service import generate_article_from_transcript, LLMArticleOutput, ANTHROPIC_API_KEY_AVAILABLE
+
 
 app = FastAPI(
     title="Video-to-Article AI API",
@@ -31,15 +35,15 @@ class ProcessVideoRequest(BaseModel):
         max_length=500
     )
 
-# Updated response model to include fetched YouTube data
+# Updated response model to include LLM processed data
 class ProcessVideoResponse(BaseModel):
     message: str
     video_url_received: HttpUrl
     search_intent_received: str | None
-    video_data: YouTubeVideoMetadata | None = None # This will hold title, duration, transcript
-    # Later, this will also include: llm_summary, llm_table_of_contents, llm_article_html, etc.
+    video_data: YouTubeVideoMetadata | None = None
+    llm_article_data: LLMArticleOutput | None = None # To hold summary, ToC, article sections
 
-# --- Utility Functions --- (Keep your validate_youtube_url function)
+# --- Utility Functions ---
 YOUTUBE_URL_PATTERN = re.compile(
     r"^(https://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})$"
 )
@@ -55,7 +59,10 @@ async def read_root():
 
 @app.get("/health", response_model=HealthCheckResponse, tags=["General"])
 async def health_check():
-    return HealthCheckResponse(status="ok", message="API is healthy")
+    # Check if LLM API Key is available as part of health
+    if not ANTHROPIC_API_KEY_AVAILABLE:
+        return HealthCheckResponse(status="degraded", message="API is running, but LLM service may be unavailable due to missing API key.")
+    return HealthCheckResponse(status="ok", message="API is healthy and LLM client initialized.")
 
 @app.post("/process-video", response_model=ProcessVideoResponse, tags=["Video Processing"])
 async def process_video_endpoint(request_data: ProcessVideoRequest):
@@ -71,37 +78,79 @@ async def process_video_endpoint(request_data: ProcessVideoRequest):
     if request_data.search_intent:
         print(f"Search intent: {request_data.search_intent}")
 
+    # 1. Fetch YouTube video data (metadata and transcript)
     video_metadata_result = await fetch_youtube_video_data(video_url_str)
 
     if video_metadata_result.error:
-        # You could raise an HTTPException here if you prefer, 
-        # or return it in the response for the client to handle.
-        # For MVP, returning it in the response is okay.
         print(f"Error fetching video data: {video_metadata_result.error}")
-        # We still return a 200 OK here, but with an error message in the video_data
-        # Alternatively, if any error means failure, raise HTTPException:
-        # raise HTTPException(status_code=422, detail=f"Failed to process video: {video_metadata_result.error}")
+        # Return error from YouTube fetching stage
         return ProcessVideoResponse(
             message=f"Failed to fetch video data: {video_metadata_result.error}",
             video_url_received=request_data.video_url,
             search_intent_received=request_data.search_intent,
-            video_data=video_metadata_result
+            video_data=video_metadata_result, # Include the partial data with the error
+            llm_article_data=None
         )
 
-    # --- Placeholder for LLM processing logic ---
-    # 1. If video_metadata_result.transcript is available:
-    #    Call LLM to process transcript (Future Step)
-    # 2. Format and return the article (Future Step)
-    # --- End Placeholder ---
+    if not video_metadata_result.transcript or not video_metadata_result.transcript:
+        print("No transcript available to process with LLM.")
+        return ProcessVideoResponse(
+            message="Successfully fetched video metadata, but no transcript was available for LLM processing.",
+            video_url_received=request_data.video_url,
+            search_intent_received=request_data.search_intent,
+            video_data=video_metadata_result,
+            llm_article_data=None
+        )
+
+    # 2. If transcript is available, process with LLM
+    print("Transcript fetched. Proceeding to LLM processing...")
     
-    # For now, return the fetched metadata and transcript.
+    # Convert Pydantic TranscriptSegment objects to simple dicts if that's what llm_service expects
+    # (Our llm_service currently expects List[Dict[str, Any]])
+    transcript_for_llm: List[Dict[str, Any]] = []
+    if video_metadata_result.transcript: # Should be true if we passed the check above
+        for segment in video_metadata_result.transcript:
+            transcript_for_llm.append({"text": segment.text, "start": segment.start, "duration": segment.duration})
+    
+    llm_processed_article: LLMArticleOutput | None = None
+    if ANTHROPIC_API_KEY_AVAILABLE:
+        try:
+            llm_processed_article = await generate_article_from_transcript(
+                transcript_segments=transcript_for_llm,
+                user_search_intent=request_data.search_intent,
+                video_title=video_metadata_result.title
+            )
+        except Exception as e:
+            # Catch potential errors from the LLM service call itself if they weren't handled within
+            print(f"Error during LLM processing: {e}")
+            # Decide if you want to raise HTTPException or return an error in the response
+            return ProcessVideoResponse(
+                message=f"Successfully fetched video data, but LLM processing failed: {str(e)}",
+                video_url_received=request_data.video_url,
+                search_intent_received=request_data.search_intent,
+                video_data=video_metadata_result,
+                llm_article_data=LLMArticleOutput(summary=f"Error: LLM processing failed. {str(e)}", table_of_contents=[], article_sections=[]) # Provide a default error structure
+            )
+    else:
+        print("LLM processing skipped due to API key unavailability.")
+        # Optionally provide a specific LLMArticleOutput indicating skipped processing
+        llm_processed_article = LLMArticleOutput(
+            summary="LLM processing was skipped because the API key is not available.",
+            table_of_contents=[],
+            article_sections=[]
+        )
+
+
     return ProcessVideoResponse(
-        message="Successfully fetched video metadata and transcript.",
+        message="Video processed successfully.",
         video_url_received=request_data.video_url,
         search_intent_received=request_data.search_intent,
-        video_data=video_metadata_result
+        video_data=video_metadata_result,
+        llm_article_data=llm_processed_article
     )
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True) # Note: "app.main:app" if running from backend_api dir
+    # Ensure Uvicorn uses the correct app instance string: "module_name:app_instance_name"
+    # If main.py is in app/, and you run from backend_api/, it's "app.main:app"
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
