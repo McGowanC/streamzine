@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Body
+from fastapi.middleware.cors import CORSMiddleware # <--- IMPORT THIS
 from pydantic import BaseModel, HttpUrl, Field
 import os
 from dotenv import load_dotenv
@@ -19,6 +20,31 @@ app = FastAPI(
     description="API to process YouTube videos into structured articles.",
     version="0.1.0",
 )
+
+# --- Add CORS Middleware ---
+# Origins that are allowed to make cross-origin requests
+# For development, you might allow all origins ("*") or specify your local file origin (though "null" can be tricky)
+# or the origin of your local frontend development server if you use one.
+# For production, you should restrict this to your actual frontend domain.
+
+origins = [
+    "http://localhost", # If you were serving frontend from localhost (any port)
+    "http://localhost:3000", # Example if your frontend dev server runs on 3000
+    "http://localhost:5500", # Common for VS Code Live Server
+    "http://127.0.0.1:5500", # Common for VS Code Live Server
+    "null", # To allow requests from `file:///` origins (USE WITH CAUTION IN PRODUCTION)
+    # Add your deployed frontend's origin here when you deploy it (e.g., "https://your-frontend.vercel.app")
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins, # Allows specific origins
+    # allow_origins=["*"], # Allows all origins (less secure, okay for very early local dev)
+    allow_credentials=True, # Allows cookies to be included in cross-origin requests (not strictly needed for this app yet)
+    allow_methods=["*"],    # Allows all methods (GET, POST, PUT, DELETE, etc.)
+    allow_headers=["*"],    # Allows all headers
+)
+# --- End CORS Middleware ---
 
 # --- Pydantic Models (Request/Response Schemas) ---
 
