@@ -33,6 +33,7 @@ origins = [
     "http://localhost:5500", # Common for VS Code Live Server
     "http://127.0.0.1:5500", # Common for VS Code Live Server
     "null", # To allow requests from `file:///` origins (USE WITH CAUTION IN PRODUCTION)
+    "https://streamzinefrontend.vercel.app",
     # Add your deployed frontend's origin here when you deploy it (e.g., "https://your-frontend.vercel.app")
 ]
 

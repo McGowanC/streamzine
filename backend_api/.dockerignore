@@ -1,0 +1,15 @@
+# Ignore Python virtual environments
+venv/
+__pycache__/
+
+# Ignore environment variables (handled by Render env settings)
+.env
+
+# Ignore IDE/editor junk
+.vscode/
+*.log
+*.pyc
+
+# Ignore git history (optional, keeps image smaller)
+.git
+.gitignore

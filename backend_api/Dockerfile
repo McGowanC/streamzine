@@ -15,6 +15,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy the rest of the application code (everything in the current directory) into the container at /code
 COPY ./app /code/app
 
+# Expose port (informational, not mandatory but nice)
+EXPOSE 8080
+
 # Define environment variable (Cloud Run will set this, good for local testing too)
 ENV PORT=8080
 
