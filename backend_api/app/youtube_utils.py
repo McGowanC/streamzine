@@ -1,17 +1,18 @@
 import asyncio
 import functools
-import yt_dlp
-from yt_dlp.utils import DownloadError as YtDlpDownloadError
+import os # For getting API key from environment
+
+# Google API Client
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError as GoogleHttpError
+
+# Transcript API (still needed)
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable as TranscriptVideoUnavailable
-# Removed: from youtube_transcript_api._errors import RequestsError as YoutubeTranscriptApiRequestsError
-# We will catch more general exceptions or rely on the library's specific ones.
-# If needed, you could import requests.exceptions directly if you wanted to catch its errors
-# import requests.exceptions # Example, not used in this immediate fix
 
 from pydantic import BaseModel
-from typing import List
+from typing import List, Tuple, Optional # Added Tuple, Optional
 
-# ... (TranscriptSegment and VideoMetadata Pydantic models remain the same) ...
+# --- Pydantic Models (TranscriptSegment, VideoMetadata) remain the same ---
 class TranscriptSegment(BaseModel):
     text: str
     start: float
@@ -25,46 +26,91 @@ class VideoMetadata(BaseModel):
     error: str | None = None
     error_type: str | None = None
 
+# --- Helper to parse ISO 8601 duration (from YouTube API) to seconds ---
+def parse_iso8601_duration(duration_str: Optional[str]) -> int:
+    if not duration_str or not duration_str.startswith('PT'):
+        return 0
+    
+    duration_str = duration_str[2:] # Remove 'PT'
+    seconds = 0
+    minutes = 0
+    hours = 0
 
-def get_video_id_from_url(url: str) -> str | None: # Renamed to avoid conflict if you keep old pytube
+    if 'H' in duration_str:
+        parts = duration_str.split('H')
+        hours = int(parts[0])
+        duration_str = parts[1] if len(parts) > 1 else ''
+    if 'M' in duration_str:
+        parts = duration_str.split('M')
+        minutes = int(parts[0])
+        duration_str = parts[1] if len(parts) > 1 else ''
+    if 'S' in duration_str:
+        seconds = int(duration_str.replace('S', ''))
+    
+    return hours * 3600 + minutes * 60 + seconds
+
+# --- Function to get video ID (remains the same) ---
+def get_video_id_from_url(url: str) -> str | None:
     if "watch?v=" in url:
         return url.split("watch?v=")[1].split("&")[0]
     elif "youtu.be/" in url:
         return url.split("youtu.be/")[1].split("?")[0]
     return None
 
-async def _fetch_metadata_with_yt_dlp(video_url_str: str, attempt_num: int, max_attempts: int):
-    print(f"yt-dlp: Attempt {attempt_num}/{max_attempts} fetching metadata for {video_url_str}")
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'format': 'best',
-        'skip_download': True,
-        'simulate': True,
-        'extract_flat': 'discard_in_playlist',
-        'nocheckcertificate': True,
-    }
+# --- NEW: Fetch metadata using YouTube Data API v3 ---
+async def _fetch_metadata_with_youtube_api(
+    video_id: str, 
+    api_key: str, 
+    attempt_num: int, 
+    max_attempts: int
+) -> Tuple[Optional[str], int, Optional[str], Optional[str]]:
+    # Returns: title, duration_seconds, error_message, error_type
+    print(f"YouTubeAPI: Attempt {attempt_num}/{max_attempts} fetching metadata for {video_id}")
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            blocking_call = functools.partial(ydl.extract_info, video_url_str, download=False)
-            info_dict = await asyncio.to_thread(blocking_call)
+        # serviceName, version, developerKey
+        # This is a blocking call, so run in a thread
+        youtube_service = await asyncio.to_thread(build, 'youtube', 'v3', developerKey=api_key)
         
-        video_id_fetched = info_dict.get("id")
-        title_fetched = info_dict.get("title", "N/A")
-        duration_fetched = int(info_dict.get("duration", 0))
-        print(f"yt-dlp: Success - Title: '{title_fetched}', Duration: {duration_fetched}s for video ID {video_id_fetched}")
-        return video_id_fetched, title_fetched, duration_fetched, None, None
-    except YtDlpDownloadError as e:
-        error_message = f"yt-dlp DownloadError: {str(e)}"
-        error_type = "YtDlpDownloadError"
-        print(f"{error_type} for {video_url_str}: {error_message}")
-        return None, "N/A", 0, error_message, error_type
-    except Exception as e:
-        error_message = f"Unexpected error in _fetch_metadata_with_yt_dlp: {str(e)}"
-        error_type = type(e).__name__
-        print(f"{error_type} for {video_url_str}: {error_message}")
-        return None, "N/A", 0, error_message, error_type
+        request = youtube_service.videos().list(
+            part="snippet,contentDetails", # snippet for title, contentDetails for duration
+            id=video_id
+        )
+        # This is also blocking
+        response = await asyncio.to_thread(request.execute)
 
+        if not response.get("items"):
+            print(f"YouTubeAPI: Video not found or no items returned for {video_id}")
+            return "N/A", 0, "Video not found via API", "YouTubeAPIVideoNotFound"
+        
+        video_item = response["items"][0]
+        title = video_item["snippet"]["title"]
+        iso_duration = video_item["contentDetails"].get("duration")
+        duration_seconds = parse_iso8601_duration(iso_duration)
+        
+        print(f"YouTubeAPI: Success - Title: '{title}', Duration: {duration_seconds}s for {video_id}")
+        return title, duration_seconds, None, None # Success
+        
+    except GoogleHttpError as e:
+        error_content = e.resp.reason if hasattr(e.resp, 'reason') else str(e)
+        try: # Try to parse error details from content
+            error_details = e.content.decode()
+            error_content = f"{error_content} - Details: {error_details}"
+        except: pass
+
+        error_message = f"YouTube Data API HttpError: {e.status_code} {error_content}"
+        error_type = f"YouTubeAPI_HttpError_{e.status_code}"
+        print(f"{error_type} for {video_id}: {error_message}")
+        # Specific check for quotaExceeded or similar errors
+        if "quotaExceeded" in error_message or "servingLimitExceeded" in error_message:
+            error_type = "YouTubeAPI_QuotaExceeded"
+        return "N/A", 0, error_message, error_type
+    except Exception as e:
+        error_message = f"Unexpected error fetching metadata via YouTube API: {str(e)}"
+        error_type = f"YouTubeAPI_{type(e).__name__}"
+        print(f"{error_type} for {video_id}: {error_message}")
+        return "N/A", 0, error_message, error_type
+
+# --- Fetch transcript (remains largely the same, but uses asyncio.to_thread) ---
 async def _fetch_transcript_with_api(video_id: str, attempt_num: int, max_attempts: int):
     print(f"TranscriptAPI: Attempt {attempt_num}/{max_attempts} fetching transcript for {video_id}")
     try:
@@ -81,85 +127,87 @@ async def _fetch_transcript_with_api(video_id: str, attempt_num: int, max_attemp
         error_type = type(e_transcript).__name__
         print(f"{error_type} for {video_id}: {error_message}")
         return None, error_message, error_type
-    # Catching a more general Exception for other potential network issues from the underlying requests library
-    # If youtube_transcript_api raises an error that isn't one of its specific ones above,
-    # it will be caught here.
     except Exception as e:
-        error_message = f"Error during transcript fetching (possibly network related): {str(e)}"
-        error_type = f"TranscriptFetch_{type(e).__name__}" # More specific error type
+        error_message = f"Error during transcript fetching: {str(e)}"
+        error_type = f"TranscriptFetch_{type(e).__name__}"
         print(f"{error_type} for {video_id}: {error_message}")
         return None, error_message, error_type
 
-
-# ... (The rest of fetch_youtube_video_data orchestrator function remains the same as the previous version I gave you) ...
+# --- Main Orchestrator Function (Modified) ---
 async def fetch_youtube_video_data(video_url_str: str) -> VideoMetadata:
-    # Get initial video_id from URL, mainly for error reporting if metadata fetch fails entirely
-    parsed_video_id_from_url = get_video_id_from_url(video_url_str)
-    if not parsed_video_id_from_url:
+    youtube_api_key = os.getenv("YOUTUBE_DATA_API_KEY")
+    if not youtube_api_key:
+        print("ERROR: YOUTUBE_DATA_API_KEY environment variable not set.")
+        return VideoMetadata(video_id="", title="", duration=0, error="Server configuration error: Missing YouTube Data API Key.", error_type="ServerConfigError")
+
+    video_id_from_url = get_video_id_from_url(video_url_str)
+    if not video_id_from_url:
         return VideoMetadata(video_id="", title="N/A", duration=0, error="Invalid YouTube URL or could not extract Video ID.", error_type="InvalidURL")
 
     max_retries = 3
-    base_backoff_seconds = 3 # Slightly increased base backoff
+    base_backoff_seconds = 2
 
-    # --- Stage 1: Fetch Metadata (Title, Duration, Confirmed Video ID) with yt-dlp ---
-    video_id_final = parsed_video_id_from_url
+    # --- Stage 1: Fetch Metadata with YouTube Data API v3 ---
     title_final = "N/A"
     duration_final = 0
-    metadata_error_message = None
-    metadata_error_type = None
+    metadata_error_message: Optional[str] = None
+    metadata_error_type: Optional[str] = None
 
     for attempt in range(max_retries):
-        vid_id, title, duration, err_msg, err_type = await _fetch_metadata_with_yt_dlp(video_url_str, attempt + 1, max_retries)
-        if vid_id and not err_msg: # Success
-            video_id_final = vid_id
+        title, duration_s, err_msg, err_type = await _fetch_metadata_with_youtube_api(
+            video_id_from_url, youtube_api_key, attempt + 1, max_retries
+        )
+        if not err_msg and title != "N/A": # Success if no error and title is found
             title_final = title
-            duration_final = duration
-            metadata_error_message = None # Clear previous attempt errors
+            duration_final = duration_s
+            metadata_error_message = None
             metadata_error_type = None
-            break 
-        else: # Failure
+            break
+        else:
             metadata_error_message = err_msg
             metadata_error_type = err_type
-            # Check if error message from yt-dlp indicates a 429 or similar retryable http error
-            if err_msg and ("429" in err_msg or "too many requests" in err_msg.lower() or "urlopen error http error 403" in err_msg.lower()):
+            # Retry for specific API errors like 403 (Forbidden/Quota), 500, 503 (Server errors)
+            # The GoogleHttpError parsing above will set error_type like "YouTubeAPI_HttpError_403"
+            is_retryable_api_error = err_type and ("HttpError_403" in err_type or "HttpError_500" in err_type or "HttpError_503" in err_type or "QuotaExceeded" in err_type)
+            if is_retryable_api_error:
                 if attempt < max_retries - 1:
                     wait_time = base_backoff_seconds * (2 ** attempt)
-                    print(f"Retryable error detected from yt-dlp for metadata. Retrying in {wait_time} seconds...")
+                    print(f"Retryable YouTube Data API error ({err_type}). Retrying in {wait_time} seconds...")
                     await asyncio.sleep(wait_time)
                     continue
                 else:
-                    print(f"Max retries reached for yt-dlp metadata fetch with error: {err_msg}")
-                    break 
-            else: # Non-retryable yt-dlp error or other unexpected error
-                print(f"Non-retryable or unexpected error from yt-dlp metadata fetch: {err_msg}")
-                break 
+                    print(f"Max retries reached for YouTube Data API metadata fetch with error: {err_msg}")
+                    break
+            else: # Non-retryable API error
+                print(f"Non-retryable error from YouTube Data API metadata fetch: {err_msg}")
+                break
     
-    if metadata_error_message: # Metadata fetching failed after all retries or with a non-retryable error
+    if metadata_error_message:
         return VideoMetadata(
-            video_id=video_id_final, 
-            title=title_final, 
-            duration=duration_final, 
+            video_id=video_id_from_url,
+            title=title_final, # Might be "N/A" if error occurred on first try
+            duration=duration_final, # Might be 0
             transcript=None,
             error=metadata_error_message,
             error_type=metadata_error_type
         )
 
-    # --- Stage 2: Fetch Transcript with youtube-transcript-api ---
+    # --- Stage 2: Fetch Transcript (if metadata was successful) ---
     transcript_final = None
-    transcript_error_message = None
-    transcript_error_type = None
+    transcript_error_message: Optional[str] = None
+    transcript_error_type: Optional[str] = None
 
+    # (Using the same retry logic for transcript API as before)
     for attempt in range(max_retries):
-        transcript_segments, err_msg, err_type = await _fetch_transcript_with_api(video_id_final, attempt + 1, max_retries)
+        transcript_segments, err_msg, err_type = await _fetch_transcript_with_api(video_id_from_url, attempt + 1, max_retries)
         if transcript_segments and not err_msg: # Success
             transcript_final = transcript_segments
-            transcript_error_message = None # Clear previous attempt errors
+            transcript_error_message = None 
             transcript_error_type = None
             break
         else: # Failure
             transcript_error_message = err_msg
             transcript_error_type = err_type
-            # Check if error message from transcript API indicates a 429 or similar retryable http error
             if err_msg and ("429" in err_msg or "too many requests" in err_msg.lower() or "http error 403" in err_msg.lower()):
                 if attempt < max_retries - 1:
                     wait_time = base_backoff_seconds * (2 ** attempt)
@@ -169,16 +217,15 @@ async def fetch_youtube_video_data(video_url_str: str) -> VideoMetadata:
                 else:
                     print(f"Max retries reached for transcript API fetch with error: {err_msg}")
                     break
-            else: # Non-retryable transcript API error
+            else: 
                 print(f"Non-retryable or unexpected error from transcript API: {err_msg}")
                 break
     
-    # Return combined results
     return VideoMetadata(
-        video_id=video_id_final,
+        video_id=video_id_from_url,
         title=title_final,
         duration=duration_final,
         transcript=transcript_final,
-        error=transcript_error_message, # Report transcript error if it occurred, metadata was successful
+        error=transcript_error_message, # Report transcript error if it occurred
         error_type=transcript_error_type
     )

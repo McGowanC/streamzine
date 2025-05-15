@@ -43,3 +43,6 @@ watchfiles==1.0.5
 websockets==15.0.1
 youtube-transcript-api==0.6.3
 yt-dlp>=2025.4.30
+google-api-python-client>=2.0.0
+google-auth-httplib2>=0.1.0
+google-auth>=2.0.0

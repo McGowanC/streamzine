@@ -25,7 +25,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const noHistoryP = document.getElementById('no-history');
 
     // Configuration
-    //const API_BASE_URL = 'http://localhost:8000';
+    // const API_BASE_URL = 'http://localhost:8000';
     const API_BASE_URL = 'https://streamzine.onrender.com';
     const MAX_HISTORY_ITEMS = 5;
 
